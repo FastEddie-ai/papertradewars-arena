@@ -38,10 +38,15 @@ async function run(sql, args = []) {
 // single-connection pool, a deadlock.
 async function txn(fn) {
   const tx = await client.transaction("write");
+  // NOTE: pass { sql, args } as a single InStatement. HranaTransaction.execute(stmt)
+  // takes ONE argument — a second `args` parameter is silently dropped, which made
+  // every parameterized write inside a transaction fail on remote (Turso) databases
+  // with ARGS_INVALID while working fine on local SQLite. Sqlite3Transaction
+  // accepts both forms, so the object form is correct for both clients.
   const db = {
-    run: (sql, args = []) => tx.execute(sql, args),
-    one: async (sql, args = []) => (await tx.execute(sql, args)).rows[0] ?? null,
-    all: async (sql, args = []) => (await tx.execute(sql, args)).rows,
+    run: (sql, args = []) => tx.execute({ sql, args }),
+    one: async (sql, args = []) => (await tx.execute({ sql, args })).rows[0] ?? null,
+    all: async (sql, args = []) => (await tx.execute({ sql, args })).rows,
   };
   try {
     const r = await fn(db);

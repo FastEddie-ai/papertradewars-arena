@@ -442,6 +442,76 @@ console.log("— live price fetch paths (stubbed Yahoo + CoinGecko)");
   stub.close();
 }
 
+// ---------------------------------------------------------------- remote-DB write regression
+// 2026-09-16: every write route that goes through txn() 500'd in production on
+// Turso while passing QA on local SQLite. Root cause: txn() called
+// tx.execute(sql, args) — HranaTransaction.execute(stmt) takes a SINGLE
+// InStatement argument, so `args` was silently dropped and the server rejected
+// every parameterized write with ARGS_INVALID. Sqlite3Transaction accepts both
+// forms, which is why the file-DB QA never caught it. This section boots one
+// server against a REAL remote libsql (set QA_REMOTE_URL, e.g. a local sqld)
+// and drives all four txn() write paths. Skipped when QA_REMOTE_URL is unset.
+console.log("— remote-DB write regression (txn paths on a real remote client)");
+{
+  const remoteUrl = process.env.QA_REMOTE_URL;
+  if (!remoteUrl) {
+    console.log("  (skipped — set QA_REMOTE_URL to a remote libsql URL to run)");
+  } else {
+    const s4 = await startServer({
+      ADMIN_SECRET: SECRET,
+      TURSO_DATABASE_URL: remoteUrl,
+    });
+    const cR = makeClient(s4.PORT);
+    await cR.req("POST", "/admin/login", { secret: SECRET });
+
+    // Work on a brand-new week so the section is hermetic on a reused remote
+    // DB: /api/board and the admin write routes default to the LATEST week,
+    // and only a week with entry prices can score.
+    const wkLabel = "Week QA " + Date.now();
+    const rn0 = await cR.req("POST", "/admin/new-week", { label: wkLabel });
+    ok(rn0.status === 200, "remote: new-week -> 200 (txn with lastInsertRowid)");
+    const w0 = (await cR.board()).week.id;
+    ok((await cR.board()).week.label === wkLabel, "remote: new week is current");
+
+    // 1a. manual ENTRY save (the txn wrapper must pass args on remote)
+    const ebody = {};
+    for (const [t, v] of Object.entries(ENTRY)) ebody["entry_" + t] = String(v);
+    const re0 = await cR.req("POST", "/admin/prices", ebody);
+    ok(re0.status === 200 && re0.text.includes("Saved prices for 10 assets"),
+      "remote: manual entry-price save -> 200");
+    const rbE = await cR.board(w0);
+    ok(rbE.priced === false && rbE.snapshots.entry && rbE.snapshots.entry.method === "manual",
+      "remote: entry snapshot logged, still unpriced without currents");
+
+    // 1b. manual CURRENT save (the exact production failure)
+    const cur = { AAPL: 333.12, AMD: 521.02, MSFT: 493.455, NVDA: 214.73, TSLA: 360.332,
+      BTC: 75446, ETH: 2374.35, DOGE: 0.078559, XRP: 1.26, SOL: 96.26 };
+    const cbody = {};
+    for (const [t, v] of Object.entries(cur)) cbody["current_" + t] = String(v);
+    const rm = await cR.req("POST", "/admin/prices", cbody);
+    ok(rm.status === 200 && rm.text.includes("Saved prices for 10 assets"),
+      "remote: manual current-price save -> 200 (txn wrapper passes args)");
+    const rb = await cR.board(w0);
+    ok(rb.priced === true, "remote: board priced after manual save");
+    ok(rb.snapshots.current && rb.snapshots.current.method === "manual",
+      "remote: current snapshot method=manual");
+    // hand-check one leg against the known entries: NVDA (220.00 not used here;
+    // current 214.73 vs entry 212.17)
+    const nvdaLeg = rb.standings.find((s) => s.name === "ChatGPT").legs.find((l) => l.ticker === "NVDA");
+    const nvdaExp = (214.73 - 212.17) / 212.17 * 100;
+    ok(Math.abs(nvdaLeg.ret_pct - nvdaExp) < 1e-3,
+      `remote: NVDA leg matches hand calc (${nvdaLeg.ret_pct} vs ${nvdaExp.toFixed(4)})`);
+
+    // 2. AI picks editor (DELETE + INSERTs inside one txn)
+    const picksBody = {};
+    Object.values(EXPECTED_PICKS).forEach((picks, i) => { picksBody["picks_" + (i + 1)] = picks.join(","); });
+    const rp = await cR.req("POST", "/admin/ai-picks", picksBody);
+    ok(rp.status === 200 && rp.text.includes("AI picks updated"), "remote: ai-picks save -> 200");
+
+    s4.server.kill();
+  }
+}
+
 server.kill();
 console.log(`\n${pass} passed, ${fail} failed`);
 process.exit(fail ? 1 : 0);
