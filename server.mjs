@@ -107,13 +107,23 @@ function validatePicks(picks) {
 }
 
 // ---------------------------------------------------------------- live price feed
-// Stocks: Yahoo Finance v8 chart API (free, no key). Crypto: CoinGecko free API.
-// Env overrides exist for QA: YAHOO_URL_TEMPLATE, COINGECKO_URL.
+// Stocks: Yahoo Finance v8 chart API (free, no key), query1 then query2 host.
+// Crypto: CoinGecko free API, then Coinbase spot per coin.
+// Free feeds rate-limit shared cloud IPs (HTTP 429), so every source has a
+// fallback — a ticker only fails when all of its sources fail.
+// Env overrides exist for QA: YAHOO_URL_TEMPLATE, COINGECKO_URL,
+// COINBASE_URL_TEMPLATE.
 const BROWSER_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36";
-const YAHOO_URL_TEMPLATE = process.env.YAHOO_URL_TEMPLATE ||
-  "https://query1.finance.yahoo.com/v8/finance/chart/{T}?interval=1d&range=1d";
+const YAHOO_URL_TEMPLATES = process.env.YAHOO_URL_TEMPLATE
+  ? [process.env.YAHOO_URL_TEMPLATE]
+  : [
+      "https://query1.finance.yahoo.com/v8/finance/chart/{T}?interval=1d&range=1d",
+      "https://query2.finance.yahoo.com/v8/finance/chart/{T}?interval=1d&range=1d",
+    ];
 const COINGECKO_URL = process.env.COINGECKO_URL ||
   "https://api.coingecko.com/api/v3/simple/price?ids=bitcoin,ethereum,solana,ripple,dogecoin&vs_currencies=usd";
+const COINBASE_URL_TEMPLATE = process.env.COINBASE_URL_TEMPLATE ||
+  "https://api.coinbase.com/v2/prices/{T}-USD/spot";
 const STOCK_TICKERS = ["NVDA", "TSLA", "AAPL", "MSFT", "AMD"];
 const CG_ID_TO_TICKER = { bitcoin: "BTC", ethereum: "ETH", solana: "SOL", ripple: "XRP", dogecoin: "DOGE" };
 
@@ -132,35 +142,70 @@ function validPrice(v) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+// One stock ticker: try each Yahoo host in order, first valid price wins.
+async function fetchStockPrice(t) {
+  const errors = [];
+  for (const tpl of YAHOO_URL_TEMPLATES) {
+    try {
+      const body = await fetchWithTimeout(tpl.replace("{T}", t), 15000, BROWSER_UA);
+      let data;
+      try { data = JSON.parse(body); } catch { throw new Error("invalid JSON"); }
+      const p = validPrice(data?.chart?.result?.[0]?.meta?.regularMarketPrice);
+      if (p == null) throw new Error("bad/missing regularMarketPrice");
+      return p;
+    } catch (e) {
+      errors.push(String(e.message || e).slice(0, 60));
+    }
+  }
+  throw new Error(errors.join(" | "));
+}
+
+// One crypto ticker via Coinbase spot: {"data":{"amount":"123.45",...}}.
+async function fetchCoinbasePrice(ticker) {
+  const body = await fetchWithTimeout(COINBASE_URL_TEMPLATE.replace("{T}", ticker));
+  let data;
+  try { data = JSON.parse(body); } catch { throw new Error("invalid JSON"); }
+  const p = validPrice(data?.data?.amount);
+  if (p == null) throw new Error("bad/missing data.amount");
+  return p;
+}
+
 // Returns { prices: {TICKER: number}, failures: [{ticker, source, error}] }.
 // A ticker only lands in `prices` when its value parsed AND is a sane positive
 // number — failures never overwrite existing values downstream.
 async function fetchLivePrices() {
   const prices = {}, failures = [];
-  const stockResults = await Promise.allSettled(STOCK_TICKERS.map(async (t) => {
-    const body = await fetchWithTimeout(YAHOO_URL_TEMPLATE.replace("{T}", t), 15000, BROWSER_UA);
-    let data;
-    try { data = JSON.parse(body); } catch { throw new Error("invalid JSON"); }
-    const p = validPrice(data?.chart?.result?.[0]?.meta?.regularMarketPrice);
-    if (p == null) throw new Error("bad/missing regularMarketPrice");
-    return [t, p];
-  }));
+  const stockResults = await Promise.allSettled(
+    STOCK_TICKERS.map(async (t) => [t, await fetchStockPrice(t)]));
   stockResults.forEach((r, i) => {
     const t = STOCK_TICKERS[i];
     if (r.status === "fulfilled") prices[r.value[0]] = r.value[1];
     else failures.push({ ticker: t, source: "yahoo", error: String(r.reason?.message || r.reason).slice(0, 120) });
   });
+  // Crypto primary: CoinGecko single call. Anything missing falls back to
+  // Coinbase per-coin spot; a coin only fails if both sources fail.
+  let cg = null, cgError = null;
   try {
     const body = await fetchWithTimeout(COINGECKO_URL);
-    let data;
-    try { data = JSON.parse(body); } catch { throw new Error("invalid JSON"); }
-    for (const [id, ticker] of Object.entries(CG_ID_TO_TICKER)) {
-      const p = validPrice(data?.[id]?.usd);
-      if (p == null) failures.push({ ticker, source: "coingecko", error: "bad/missing usd price" });
-      else prices[ticker] = p;
-    }
+    try { cg = JSON.parse(body); } catch { throw new Error("invalid JSON"); }
   } catch (e) {
-    for (const t of Object.values(CG_ID_TO_TICKER)) failures.push({ ticker: t, source: "coingecko", error: String(e.message || e).slice(0, 120) });
+    cgError = String(e.message || e).slice(0, 60);
+  }
+  const needFallback = [];
+  for (const [id, ticker] of Object.entries(CG_ID_TO_TICKER)) {
+    const p = cg && !cgError ? validPrice(cg?.[id]?.usd) : null;
+    if (p != null) prices[ticker] = p;
+    else needFallback.push(ticker);
+  }
+  if (needFallback.length) {
+    const cbResults = await Promise.allSettled(
+      needFallback.map(async (ticker) => [ticker, await fetchCoinbasePrice(ticker)]));
+    cbResults.forEach((r, i) => {
+      const ticker = needFallback[i];
+      if (r.status === "fulfilled") prices[r.value[0]] = r.value[1];
+      else failures.push({ ticker, source: "coingecko",
+        error: `${cgError || "bad/missing usd price"}; coinbase: ${String(r.reason?.message || r.reason).slice(0, 60)}`.slice(0, 120) });
+    });
   }
   return { prices, failures };
 }

@@ -323,11 +323,13 @@ console.log("— new week rollover (Tuesday–Tuesday cycle)");
 
 console.log("— live price fetch paths (stubbed Yahoo + CoinGecko)");
 {
-  // Stub feeds: the server reads YAHOO_URL_TEMPLATE / COINGECKO_URL once at boot,
-  // so a second server instance gets pointed at this in-process stub.
-  let stubMode = "all-good"; // all-good | partial (NVDA 500s) | total (everything 500s)
+  // Stub feeds: the server reads YAHOO_URL_TEMPLATE / COINGECKO_URL /
+  // COINBASE_URL_TEMPLATE once at boot, so a second server instance gets
+  // pointed at this in-process stub.
+  let stubMode = "all-good"; // all-good | partial (NVDA 500s) | total (everything 500s) | cg-down (coingecko 500s, coinbase ok)
   const STUB_STOCK = { NVDA: 220.00, TSLA: 360.10, AAPL: 335.00, MSFT: 500.50, AMD: 510.25 };
   const STUB_CRYPTO = { bitcoin: 76000, ethereum: 2450, solana: 100.5, ripple: 1.30, dogecoin: 0.082 };
+  const CB_TICKER_TO_ID = { BTC: "bitcoin", ETH: "ethereum", SOL: "solana", XRP: "ripple", DOGE: "dogecoin" };
   const stub = http.createServer((req, res) => {
     const u = new URL(req.url, "http://stub");
     if (u.pathname.startsWith("/yahoo/")) {
@@ -340,11 +342,19 @@ console.log("— live price fetch paths (stubbed Yahoo + CoinGecko)");
       return;
     }
     if (u.pathname === "/coingecko") {
-      if (stubMode === "total") { res.writeHead(500); res.end("boom"); return; }
+      if (stubMode === "total" || stubMode === "cg-down") { res.writeHead(500); res.end("boom"); return; }
       const out = {};
       for (const [id, price] of Object.entries(STUB_CRYPTO)) out[id] = { usd: price };
       res.writeHead(200, { "content-type": "application/json" });
       res.end(JSON.stringify(out));
+      return;
+    }
+    if (u.pathname.startsWith("/coinbase/")) {
+      const t = u.pathname.split("/")[2];
+      if (stubMode === "total") { res.writeHead(500); res.end("boom"); return; }
+      const id = CB_TICKER_TO_ID[t];
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ data: { amount: String(STUB_CRYPTO[id]), base: t, currency: "USD" } }));
       return;
     }
     res.writeHead(404); res.end();
@@ -358,6 +368,7 @@ console.log("— live price fetch paths (stubbed Yahoo + CoinGecko)");
     TURSO_DATABASE_URL: `file:${s3env.dbFile}`,
     YAHOO_URL_TEMPLATE: `http://127.0.0.1:${stubPort}/yahoo/{T}`,
     COINGECKO_URL: `http://127.0.0.1:${stubPort}/coingecko`,
+    COINBASE_URL_TEMPLATE: `http://127.0.0.1:${stubPort}/coinbase/{T}`,
   });
   const cA = makeClient(s3.PORT);
   await cA.req("POST", "/admin/login", { secret: SECRET });
@@ -394,6 +405,15 @@ console.log("— live price fetch paths (stubbed Yahoo + CoinGecko)");
   ok(JSON.stringify(bAfter.standings.map((s) => s.total_ret_pct)) ===
     JSON.stringify(bBefore.standings.map((s) => s.total_ret_pct)), "total failure changes no prices");
   ok(bAfter.snapshots.current.method === "fetch", "latest ok snapshot still the good fetch");
+
+  // resilience: CoinGecko 500s -> Coinbase fallback still prices all 5 crypto
+  stubMode = "cg-down";
+  const rcg = await cA.req("POST", "/admin/fetch-current", null);
+  ok(rcg.status === 200 && rcg.text.includes("10/10 tickers"), "coingecko down -> coinbase fallback, 200, 10/10");
+  // hand-check: BTC leg = (76000 - 75643.87) / 75643.87 * 100
+  const btcRet = (76000 - 75643.87) / 75643.87 * 100;
+  const btcLeg = (await cA.board()).standings.find((s) => s.name === "ChatGPT").legs.find((l) => l.ticker === "BTC");
+  ok(Math.abs(btcLeg.ret_pct - btcRet) < 1e-3, `coinbase BTC leg matches hand calc (${btcLeg.ret_pct} vs ${btcRet.toFixed(4)})`);
 
   // fetch-entry on a fresh week (doesn't disturb the locked Week 1 entries)
   stubMode = "all-good";
