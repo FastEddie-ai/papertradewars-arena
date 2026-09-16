@@ -1,0 +1,1 @@
+{"dependencies":{"@libsql/client":"^0.18.0","bcryptjs":"^3.0.3","express":"^4.21.2"},"description":"PaperTradeWars: 5 AIs + 1 monkey draft weekly paper-trading portfolios; humans can draft alongside them.","engines":{"node":">=22"},"main":"server.mjs","name":"investor-arena","scripts":{"qa":"node test-qa.mjs","start":"node server.mjs"},"type":"module","version":"0.1.0"}

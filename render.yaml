@@ -1,0 +1,25 @@
+# Render blueprint for the PaperTradeWars arena (single web service).
+services:
+  - type: web
+    name: papertradewars-arena
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.mjs
+    healthCheckPath: /api/health
+    envVars:
+      - key: ADMIN_SECRET
+        generateValue: true
+      - key: SITE_TITLE
+        value: PaperTradeWars
+      - key: TURSO_DATABASE_URL
+        sync: false
+      - key: TURSO_AUTH_TOKEN
+        sync: false
+      - key: APP_URL
+        sync: false
+# Turso is the primary database. If TURSO_DATABASE_URL is unset the app falls
+# back to a local SQLite file — fine for dev, but Render's free tier has no
+# persistent disk, so the file resets on redeploy/restart. Set the Turso vars
+# plus APP_URL (the https Render URL, enables Secure session cookies) in the
+# Render dashboard before real users draft.
