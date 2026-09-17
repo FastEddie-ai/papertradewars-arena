@@ -531,6 +531,18 @@ async function adminPanel(weekId, msg, err) {
   const picks = await aiPicksFor(weekId);
   const entrySnap = await latestSnapshot(weekId, "entry");
   const currentSnap = await latestSnapshot(weekId, "current");
+  const humans = await all(`SELECT u.id, u.display_name, u.email, d.picks AS draft_picks
+    FROM users u LEFT JOIN drafts d ON d.user_id = u.id AND d.week_id = ?
+    ORDER BY u.created_at`, [weekId]);
+  const humanRows = humans.map((h) => {
+    let picks = "no draft yet";
+    try { const arr = JSON.parse(h.draft_picks); if (Array.isArray(arr) && arr.length) picks = arr.join(", "); } catch (_) { /* keep default */ }
+    return `<tr><td><strong>${esc(h.display_name)}</strong><br><span class="mut">${esc(h.email)}</span></td>
+      <td class="mut">${esc(picks)}</td>
+      <td><form method="POST" action="/admin/delete-user" onsubmit="return confirm('Delete this account and all its drafts?')">
+      <input type="hidden" name="user_id" value="${esc(h.id)}">
+      <button class="btn sec" type="submit">Delete</button></form></td></tr>`;
+  }).join("");
   const priceRows = assets.map((a) => {
     const pr = prices[a.ticker] || {};
     return `<tr><td><strong>${a.ticker}</strong><br><span class="mut">${esc(a.name)}</span></td>
@@ -553,6 +565,8 @@ async function adminPanel(weekId, msg, err) {
         <button class="btn" type="submit">📸 Fetch &amp; set ENTRY prices</button></form>
       <form method="POST" action="/admin/fetch-current" style="display:inline-block;margin:4px 0">
         <button class="btn sec" type="submit">🔄 Fetch &amp; update CURRENT prices</button></form>
+      <form method="POST" action="/admin/fix-entry-stamp" style="display:inline-block;margin:4px 0 4px 8px">
+        <button class="btn sec" type="submit">↩️ Restore entry timestamp to lock time</button></form>
     </div>
     <div class="card"><h2>💰 Prices — ${esc(week.label)} (manual fallback)</h2>
       <p class="mut">Entry prices lock Tuesday ~4:35 PM ET. Update "current" any time; leaderboard recomputes live.</p>
@@ -562,6 +576,10 @@ async function adminPanel(weekId, msg, err) {
     <div class="card"><h2>🤖 AI picks — ${esc(week.label)}</h2>
       <form method="POST" action="/admin/ai-picks">${pickEditors}
       <button class="btn" type="submit" style="margin-top:12px">Save AI picks</button></form></div>
+    <div class="card"><h2>🧑 Humans — ${esc(week.label)}</h2>
+      <p class="mut">Human drafters. Deleting an account removes it, its sessions, and all its drafts.</p>
+      ${humans.length ? `<table class="board"><tr><th>Account</th><th>Draft</th><th></th></tr>${humanRows}</table>`
+        : `<p class="mut">No human accounts yet.</p>`}</div>
     <div class="card"><h2>📅 New week</h2>
       <p class="mut">Opens a new week on the Tuesday–Tuesday cycle: human drafts reset (they're per-week), AI picks carry over for editing, prices start empty.</p>
       <form method="POST" action="/admin/new-week"><label>Label<input type="text" name="label" value="Week ${week.id + 1}"></label>
@@ -743,6 +761,9 @@ app.post("/admin/prices", requireAdmin, ah(async (req, res) => {
   const weekId = await currentWeekId();
   const entryVals = {}, currentVals = {};
   const updates = [];
+  // Stored prices BEFORE this save, so we can tell whether the admin actually
+  // changed the entry values (vs. re-submitting the same form untouched).
+  const stored = await pricesFor(weekId);
   for (const a of await listAssets()) {
     const e = req.body["entry_" + a.ticker], c = req.body["current_" + a.ticker];
     const entry = e === "" || e == null ? null : Number(e);
@@ -774,7 +795,13 @@ app.post("/admin/prices", requireAdmin, ah(async (req, res) => {
     }
   });
   // Manual saves join the same audit trail so the board always shows the truth.
-  if (Object.keys(entryVals).length) await logSnapshot(weekId, "entry", "manual", entryVals, [], true);
+  // But a save that leaves entry prices untouched must NOT move the "entry
+  // taken" timestamp — otherwise the board claims entries locked at the wrong time.
+  const entryChanged = Object.entries(entryVals).some(([t, v]) => {
+    const prev = stored[t] && stored[t].entry;
+    return prev == null || Math.abs(prev - v) > 1e-9;
+  });
+  if (Object.keys(entryVals).length && entryChanged) await logSnapshot(weekId, "entry", "manual", entryVals, [], true);
   if (Object.keys(currentVals).length) await logSnapshot(weekId, "current", "manual", currentVals, [], true);
   res.send(await adminPanel(weekId, `Saved prices for ${updates.length} assets. Leaderboard recomputed.`));
 }));
@@ -838,6 +865,34 @@ app.post("/admin/new-week", requireAdmin, ah(async (req, res) => {
     return newId;
   });
   res.send(await adminPanel(id, `${label} is open. Human drafts reset; AI picks carried over — edit them above if needed.`));
+}));
+
+// Delete a human account (test accounts, abuse): removes the user row plus
+// their sessions and all drafts, so they vanish from every leaderboard.
+app.post("/admin/delete-user", requireAdmin, ah(async (req, res) => {
+  const weekId = await currentWeekId();
+  const userId = String(req.body.user_id || "").trim();
+  if (!userId) return res.status(400).send(await adminPanel(weekId, "", "Missing user id."));
+  const target = await one("SELECT display_name FROM users WHERE id = ?", [userId]);
+  await txn(async (db) => {
+    await db.run("DELETE FROM drafts WHERE user_id = ?", [userId]);
+    await db.run("DELETE FROM sessions WHERE user_id = ?", [userId]);
+    await db.run("DELETE FROM users WHERE id = ?", [userId]);
+  });
+  res.send(await adminPanel(weekId,
+    target ? `Deleted human account “${target.display_name}” — their drafts are gone from the board.` : "User not found — nothing deleted."));
+}));
+
+// One-click repair if the entry snapshot timestamp ever gets moved by a manual
+// save that didn't change entry values: restores it to the week's lock label.
+app.post("/admin/fix-entry-stamp", requireAdmin, ah(async (req, res) => {
+  const weekId = await currentWeekId();
+  const week = await getWeek(weekId);
+  const snap = await latestSnapshot(weekId, "entry");
+  if (!snap) return res.status(400).send(await adminPanel(weekId, "", "No entry snapshot to repair."));
+  if (!week.entry_label) return res.status(400).send(await adminPanel(weekId, "", "This week has no entry lock label."));
+  await run("UPDATE price_snapshots SET fetched_at_et = ? WHERE id = ?", [week.entry_label, snap.id]);
+  res.send(await adminPanel(weekId, `Entry timestamp restored to “${week.entry_label}”.`));
 }));
 
 // JSON board (for QA + future video tooling)
